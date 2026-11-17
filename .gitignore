@@ -1,0 +1,10 @@
+# Rust
+/target
+
+# Local disk image test artifacts
+/test-*.img
+/test-images/
+
+# Python
+__pycache__/
+*.py[cod]

@@ -4,6 +4,7 @@ pub mod mbr;
 use anyhow::Result;
 
 use crate::disk::reader::DiskImageReader;
+use crate::filesystem::detector;
 
 pub fn analyze(reader: &mut DiskImageReader) -> Result<()> {
     println!("\n========== PARTITION ANALYSIS ==========");
@@ -24,7 +25,7 @@ pub fn analyze(reader: &mut DiskImageReader) -> Result<()> {
             println!("No allocated GPT partitions found.");
         }
 
-        for partition in partitions {
+        for partition in &partitions {
             println!("\nPartition #{}", partition.index);
             println!("  Name       : {}", partition.name);
             println!("  Type GUID  : {}", partition.type_guid);
@@ -32,6 +33,10 @@ pub fn analyze(reader: &mut DiskImageReader) -> Result<()> {
             println!("  First LBA  : {}", partition.first_lba);
             println!("  Last LBA   : {}", partition.last_lba);
             println!("  Size       : {} bytes", partition.size_bytes());
+
+            let filesystem = detector::detect(reader, partition.first_lba, partition.size_bytes())?;
+
+            println!("  Filesystem : {}", filesystem);
         }
 
         return Ok(());
@@ -53,7 +58,7 @@ pub fn analyze(reader: &mut DiskImageReader) -> Result<()> {
         println!("No allocated MBR partitions found.");
     }
 
-    for partition in partitions {
+    for partition in &partitions {
         println!("\nPartition #{}", partition.index);
         println!("  Bootable : {}", partition.bootable);
         println!(
@@ -64,6 +69,14 @@ pub fn analyze(reader: &mut DiskImageReader) -> Result<()> {
         println!("  Start LBA: {}", partition.start_lba);
         println!("  Sectors  : {}", partition.sectors);
         println!("  Size     : {} bytes", partition.size_bytes());
+
+        let filesystem = detector::detect(
+            reader,
+            u64::from(partition.start_lba),
+            partition.size_bytes(),
+        )?;
+
+        println!("  Filesystem: {}", filesystem);
     }
 
     Ok(())

@@ -1,5 +1,6 @@
 mod devices;
 mod disk;
+mod filesystem;
 mod partition;
 
 use anyhow::Result;
