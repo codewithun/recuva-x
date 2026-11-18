@@ -5,6 +5,48 @@ use anyhow::Result;
 
 use crate::disk::reader::DiskImageReader;
 use crate::filesystem::detector;
+use crate::filesystem::metadata;
+
+fn display_filesystem_metadata(
+    reader: &mut DiskImageReader,
+    filesystem: detector::FileSystem,
+    start_lba: u64,
+    partition_size: u64,
+) {
+    if filesystem != detector::FileSystem::Fat32 {
+        return;
+    }
+
+    match metadata::fat32::read(reader, start_lba, partition_size) {
+        Ok(info) => {
+            println!("  FAT32 Metadata:");
+            println!("    Bytes per Sector    : {}", info.bytes_per_sector);
+            println!("    Sectors per Cluster : {}", info.sectors_per_cluster);
+            println!(
+                "    Cluster Size        : {} bytes",
+                info.cluster_size_bytes
+            );
+            println!("    Reserved Sectors    : {}", info.reserved_sectors);
+            println!("    Number of FATs      : {}", info.number_of_fats);
+            println!("    Total Sectors       : {}", info.total_sectors);
+            println!(
+                "    FAT Size            : {} sectors",
+                info.fat_size_sectors
+            );
+            println!("    Root Cluster        : {}", info.root_cluster);
+            println!("    Data Clusters       : {}", info.data_cluster_count);
+            println!(
+                "    FAT Capacity        : {} entries",
+                info.fat_capacity_entries
+            );
+            println!("    Volume Size         : {} bytes", info.volume_size_bytes);
+        }
+        Err(error) => {
+            println!("  FAT32 Metadata       : Unable to read metadata");
+            println!("  Metadata Error       : {error:#}");
+        }
+    }
+}
 
 pub fn analyze(reader: &mut DiskImageReader) -> Result<()> {
     println!("\n========== PARTITION ANALYSIS ==========");
@@ -37,6 +79,13 @@ pub fn analyze(reader: &mut DiskImageReader) -> Result<()> {
             let filesystem = detector::detect(reader, partition.first_lba, partition.size_bytes())?;
 
             println!("  Filesystem : {}", filesystem);
+
+            display_filesystem_metadata(
+                reader,
+                filesystem,
+                partition.first_lba,
+                partition.size_bytes(),
+            );
         }
 
         return Ok(());
@@ -77,6 +126,13 @@ pub fn analyze(reader: &mut DiskImageReader) -> Result<()> {
         )?;
 
         println!("  Filesystem: {}", filesystem);
+
+        display_filesystem_metadata(
+            reader,
+            filesystem,
+            u64::from(partition.start_lba),
+            partition.size_bytes(),
+        );
     }
 
     Ok(())
