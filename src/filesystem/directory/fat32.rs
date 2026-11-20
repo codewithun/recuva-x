@@ -449,28 +449,17 @@ mod tests {
         assert_eq!(entries[1].name, "SECOND.TXT");
     }
 
-
     #[test]
     #[ignore = "Requires local test-images/test-fat32-directory.img"]
     fn reads_real_fat32_directory_image() {
-        let path = std::path::Path::new(
-            "test-images/test-fat32-directory.img"
-        );
+        let path = std::path::Path::new("test-images/test-fat32-directory.img");
 
         let mut reader = DiskImageReader::open(path).unwrap();
 
-        let mut directory_reader =
-            Fat32ClusterReader::new(
-                &mut reader,
-                2048,
-                102_400_000,
-            )
-            .unwrap();
+        let mut directory_reader = Fat32ClusterReader::new(&mut reader, 2048, 102_400_000).unwrap();
 
         // Read root directory.
-        let root_entries = directory_reader
-            .read_directory(2)
-            .unwrap();
+        let root_entries = directory_reader.read_directory(2).unwrap();
 
         for entry in &root_entries {
             println!(
@@ -482,9 +471,7 @@ mod tests {
             );
         }
 
-        assert!(
-            root_entries.iter().any(|entry| entry.name == "hello.txt")
-        );
+        assert!(root_entries.iter().any(|entry| entry.name == "hello.txt"));
 
         assert!(
             root_entries
@@ -507,9 +494,7 @@ mod tests {
         for entry in &document_entries {
             println!(
                 "DOCUMENTS: {} | cluster={} | size={}",
-                entry.name,
-                entry.first_cluster,
-                entry.size
+                entry.name, entry.first_cluster, entry.size
             );
         }
 
@@ -519,5 +504,4 @@ mod tests {
                 .any(|entry| entry.name == "report.txt")
         );
     }
-
 }
