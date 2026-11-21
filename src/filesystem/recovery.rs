@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -86,6 +87,85 @@ pub fn recover_file(
     Ok(output_path)
 }
 
+/// Recover a directory and all its nested files and directories.
+pub fn recover_directory(
+    reader: &mut Fat32ClusterReader<'_>,
+    start_cluster: u32,
+    output_dir: impl AsRef<Path>,
+) -> Result<Vec<PathBuf>> {
+    let output_dir = output_dir.as_ref();
+
+    fs::create_dir_all(output_dir).context("Failed to create recovery directory")?;
+
+    let mut visited = HashSet::new();
+    let mut recovered_files = Vec::new();
+
+    recover_directory_recursive(
+        reader,
+        start_cluster,
+        output_dir,
+        &mut visited,
+        &mut recovered_files,
+    )?;
+
+    Ok(recovered_files)
+}
+
+fn recover_directory_recursive(
+    reader: &mut Fat32ClusterReader<'_>,
+    start_cluster: u32,
+    output_dir: &Path,
+    visited: &mut HashSet<u32>,
+    recovered_files: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if !visited.insert(start_cluster) {
+        bail!("Circular directory reference detected at cluster {start_cluster}");
+    }
+
+    let entries = reader
+        .read_directory(start_cluster)
+        .context("Failed to read directory")?;
+
+    for entry in entries {
+        let name = entry.name.as_str();
+
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+            || name.chars().any(char::is_control)
+        {
+            bail!("Invalid directory entry name");
+        }
+
+        let output_path = output_dir.join(name);
+
+        if entry.is_directory() {
+            if entry.first_cluster < 2 {
+                bail!("Invalid directory cluster for {name}");
+            }
+
+            fs::create_dir_all(&output_path)
+                .with_context(|| format!("Failed to create directory {name}"))?;
+
+            recover_directory_recursive(
+                reader,
+                entry.first_cluster,
+                &output_path,
+                visited,
+                recovered_files,
+            )?;
+        } else {
+            let recovered = recover_file(reader, &entry, output_dir)?;
+
+            recovered_files.push(recovered);
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +223,42 @@ mod tests {
         assert_eq!(fs::read(recovered).unwrap(), b"This is a test document\n");
 
         let _ = fs::remove_dir_all(&output_dir);
+    }
+
+    #[test]
+    #[ignore = "Requires local FAT32 test image"]
+    fn recovers_nested_fat32_directory() {
+        let image_path = "test-images/test-fat32-directory.img";
+
+        let output = std::env::temp_dir().join("recuvax-recursive-test");
+
+        let _ = fs::remove_dir_all(&output);
+
+        let mut disk = DiskImageReader::open(image_path).unwrap();
+
+        let mut fat = Fat32ClusterReader::new(&mut disk, 2048, 102_400_000).unwrap();
+
+        let recovered = recover_directory(&mut fat, 2, &output).unwrap();
+
+        assert_eq!(recovered.len(), 3);
+
+        assert_eq!(
+            fs::read(output.join("hello.txt")).unwrap(),
+            b"Hello from RecuvaX\n"
+        );
+
+        assert_eq!(
+            fs::read(output.join("notes with spaces.txt")).unwrap(),
+            b"Testing FAT32 directory parser\n"
+        );
+
+        assert_eq!(
+            fs::read(output.join("Documents/report.txt")).unwrap(),
+            b"This is a test document\n"
+        );
+
+        println!("Recovered {} files", recovered.len());
+
+        let _ = fs::remove_dir_all(&output);
     }
 }
