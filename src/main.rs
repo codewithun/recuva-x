@@ -2,6 +2,7 @@ mod devices;
 mod disk;
 mod filesystem;
 mod partition;
+mod recovery_cli;
 
 use anyhow::Result;
 use dialoguer::{Input, Select, theme::ColorfulTheme};
@@ -67,7 +68,10 @@ fn handle_selection(selection: usize) -> Result<bool> {
 
         2 => {
             println!("{}", "\nQuick Recovery".bright_cyan());
-            println!("Recovery engine is not implemented yet.");
+
+            if let Err(error) = recovery_cli::run() {
+                eprintln!("{} {error:#}", "[ERROR]".bright_red().bold());
+            }
             pause()?;
         }
 
