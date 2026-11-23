@@ -1,3 +1,4 @@
+mod carving;
 mod devices;
 mod disk;
 mod filesystem;
@@ -77,7 +78,11 @@ fn handle_selection(selection: usize) -> Result<bool> {
 
         3 => {
             println!("{}", "\nDeep Recovery".bright_cyan());
-            println!("File carving is not implemented yet.");
+
+            if let Err(error) = carving::cli::run() {
+                eprintln!("{} {error:#}", "[ERROR]".bright_red().bold());
+            }
+
             pause()?;
         }
 
