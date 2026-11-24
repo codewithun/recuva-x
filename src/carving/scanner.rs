@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::disk::reader::DiskImageReader;
 
 use super::signatures::FileFormat;
+use super::validator;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 const MAX_FILE_SIZE: u64 = 64 * 1024 * 1024;
@@ -143,6 +144,36 @@ fn scan_format(
 
         let data = reader.read_bytes(header_offset, read_length)?;
 
+        let validation = match format {
+            FileFormat::Png => validator::validate_png(&data),
+            FileFormat::Jpeg => validator::validate_jpeg(&data),
+            FileFormat::Pdf => Ok(()),
+        };
+
+        if let Err(reason) = validation {
+            println!(
+                "Skipping invalid {} candidate at offset {}: {}",
+                format.name(),
+                header_offset,
+                reason
+            );
+
+            cursor = header_offset + 1;
+            continue;
+        }
+
+        if format == FileFormat::Png {
+            if let Err(reason) = validator::validate_png(&data) {
+                println!(
+                    "Skipping invalid PNG candidate at offset {}: {}",
+                    header_offset, reason
+                );
+
+                cursor = header_offset + 1;
+                continue;
+            }
+        }
+
         let path = save_carved_file(output_dir, format, &mut sequence, &data)?;
 
         recovered.push(CarvedFile {
@@ -220,47 +251,13 @@ mod tests {
     }
 
     #[test]
-    fn carves_synthetic_jpeg() {
-        let image_path = temporary_path("jpeg-image");
-        let output_dir = temporary_path("jpeg-output");
-
-        let mut image = vec![0xAA; 100];
-        image.extend_from_slice(&[0xFF, 0xD8, 0xFF]);
-        image.extend_from_slice(b"JPEG TEST DATA");
-        image.extend_from_slice(&[0xFF, 0xD9]);
-        image.extend_from_slice(&[0xBB; 100]);
-
-        fs::write(&image_path, image).unwrap();
-
-        fs::create_dir_all(&output_dir).unwrap();
-
-        let mut reader = DiskImageReader::open(&image_path).unwrap();
-
-        let result = scan_format(&mut reader, &output_dir, FileFormat::Jpeg).unwrap();
-
-        assert_eq!(result.len(), 1);
-
-        let recovered = fs::read(&result[0].path).unwrap();
-
-        assert_eq!(&recovered[..3], &[0xFF, 0xD8, 0xFF]);
-        assert!(recovered.ends_with(&[0xFF, 0xD9]));
-
-        drop(reader);
-        let _ = fs::remove_file(image_path);
-        let _ = fs::remove_dir_all(output_dir);
-    }
-
-    #[test]
     fn carves_synthetic_png() {
         let image_path = temporary_path("png-image");
         let output_dir = temporary_path("png-output");
 
         let mut image = vec![0xAA; 100];
-        image.extend_from_slice(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
-        image.extend_from_slice(b"PNG TEST DATA");
-        image.extend_from_slice(&[
-            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ]);
+        image.extend_from_slice(&validator::test_png());
+        image.extend_from_slice(&[0xBB; 100]);
 
         fs::write(&image_path, image).unwrap();
         fs::create_dir_all(&output_dir).unwrap();
@@ -272,9 +269,56 @@ mod tests {
         assert_eq!(result.len(), 1);
 
         let recovered = fs::read(&result[0].path).unwrap();
+        assert!(validator::validate_png(&recovered).is_ok());
 
-        assert!(recovered.starts_with(FileFormat::Png.header()));
-        assert!(recovered.ends_with(FileFormat::Png.footer()));
+        drop(reader);
+        let _ = fs::remove_file(image_path);
+        let _ = fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn carves_synthetic_jpeg() {
+        let image_path = temporary_path("jpeg-image");
+        let output_dir = temporary_path("jpeg-output");
+
+        let mut image = vec![0xAA; 100];
+        image.extend_from_slice(&validator::test_jpeg());
+        image.extend_from_slice(&[0xBB; 100]);
+
+        fs::write(&image_path, image).unwrap();
+        fs::create_dir_all(&output_dir).unwrap();
+
+        let mut reader = DiskImageReader::open(&image_path).unwrap();
+
+        let result = scan_format(&mut reader, &output_dir, FileFormat::Jpeg).unwrap();
+
+        assert_eq!(result.len(), 1);
+
+        let recovered = fs::read(&result[0].path).unwrap();
+        assert!(validator::validate_jpeg(&recovered).is_ok());
+
+        drop(reader);
+        let _ = fs::remove_file(image_path);
+        let _ = fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn skips_invalid_jpeg() {
+        let image_path = temporary_path("invalid-jpeg-image");
+        let output_dir = temporary_path("invalid-jpeg-output");
+
+        let mut image = vec![0xAA; 100];
+        image.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0x11, 0x22, 0x33, 0xFF, 0xD9]);
+
+        fs::write(&image_path, image).unwrap();
+        fs::create_dir_all(&output_dir).unwrap();
+
+        let mut reader = DiskImageReader::open(&image_path).unwrap();
+
+        let result = scan_format(&mut reader, &output_dir, FileFormat::Jpeg).unwrap();
+
+        assert!(result.is_empty());
+        assert!(fs::read_dir(&output_dir).unwrap().next().is_none());
 
         drop(reader);
         let _ = fs::remove_file(image_path);
@@ -303,6 +347,33 @@ mod tests {
 
         assert!(recovered.starts_with(FileFormat::Pdf.header()));
         assert!(recovered.ends_with(FileFormat::Pdf.footer()));
+
+        drop(reader);
+        let _ = fs::remove_file(image_path);
+        let _ = fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn skips_invalid_png() {
+        let image_path = temporary_path("invalid-png-image");
+        let output_dir = temporary_path("invalid-png-output");
+
+        let mut image = vec![0xAA; 100];
+        image.extend_from_slice(FileFormat::Png.header());
+        image.extend_from_slice(b"INVALID PNG DATA");
+        image.extend_from_slice(FileFormat::Png.footer());
+
+        fs::write(&image_path, image).unwrap();
+        fs::create_dir_all(&output_dir).unwrap();
+
+        let mut reader = DiskImageReader::open(&image_path).unwrap();
+
+        let result = scan_format(&mut reader, &output_dir, FileFormat::Png).unwrap();
+
+        assert!(result.is_empty());
+
+        let output_files: Vec<_> = fs::read_dir(&output_dir).unwrap().collect();
+        assert!(output_files.is_empty());
 
         drop(reader);
         let _ = fs::remove_file(image_path);
