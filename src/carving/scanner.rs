@@ -147,7 +147,7 @@ fn scan_format(
         let validation = match format {
             FileFormat::Png => validator::validate_png(&data),
             FileFormat::Jpeg => validator::validate_jpeg(&data),
-            FileFormat::Pdf => Ok(()),
+            FileFormat::Pdf => validator::validate_pdf(&data),
         };
 
         if let Err(reason) = validation {
@@ -331,7 +331,7 @@ mod tests {
         let output_dir = temporary_path("pdf-output");
 
         let mut image = vec![0xAA; 100];
-        image.extend_from_slice(b"%PDF-1.7\nPDF TEST DATA\n%%EOF");
+        image.extend_from_slice(&validator::test_pdf());
         image.extend_from_slice(&[0xBB; 100]);
 
         fs::write(&image_path, image).unwrap();
@@ -369,6 +369,32 @@ mod tests {
         let mut reader = DiskImageReader::open(&image_path).unwrap();
 
         let result = scan_format(&mut reader, &output_dir, FileFormat::Png).unwrap();
+
+        assert!(result.is_empty());
+
+        let output_files: Vec<_> = fs::read_dir(&output_dir).unwrap().collect();
+        assert!(output_files.is_empty());
+
+        drop(reader);
+        let _ = fs::remove_file(image_path);
+        let _ = fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn skips_invalid_pdf() {
+        let image_path = temporary_path("invalid-pdf-image");
+        let output_dir = temporary_path("invalid-pdf-output");
+
+        let mut image = vec![0xAA; 100];
+        image.extend_from_slice(b"%PDF-1.7\nINVALID PDF DATA\n%%EOF");
+        image.extend_from_slice(&[0xBB; 100]);
+
+        fs::write(&image_path, image).unwrap();
+        fs::create_dir_all(&output_dir).unwrap();
+
+        let mut reader = DiskImageReader::open(&image_path).unwrap();
+
+        let result = scan_format(&mut reader, &output_dir, FileFormat::Pdf).unwrap();
 
         assert!(result.is_empty());
 
