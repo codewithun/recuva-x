@@ -162,18 +162,6 @@ fn scan_format(
             continue;
         }
 
-        if format == FileFormat::Png {
-            if let Err(reason) = validator::validate_png(&data) {
-                println!(
-                    "Skipping invalid PNG candidate at offset {}: {}",
-                    header_offset, reason
-                );
-
-                cursor = header_offset + 1;
-                continue;
-            }
-        }
-
         let path = save_carved_file(output_dir, format, &mut sequence, &data)?;
 
         recovered.push(CarvedFile {

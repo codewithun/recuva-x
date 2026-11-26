@@ -34,12 +34,10 @@ impl DiskImageReader {
         })
     }
 
-    pub fn read_bytes(&mut self, offset: u64, length: usize) -> Result<Vec<u8>> {
-        let length_u64 = u64::try_from(length).context("Requested read length is too large")?;
+    pub fn read_into(&mut self, offset: u64, buffer: &mut [u8]) -> Result<()> {
+        let length = u64::try_from(buffer.len()).context("Requested read length is too large")?;
 
-        let end = offset
-            .checked_add(length_u64)
-            .context("Read offset overflow")?;
+        let end = offset.checked_add(length).context("Read offset overflow")?;
 
         if end > self.size {
             bail!("Read operation exceeds image boundaries.");
@@ -49,11 +47,17 @@ impl DiskImageReader {
             .seek(SeekFrom::Start(offset))
             .context("Failed to seek to requested offset")?;
 
+        self.file
+            .read_exact(buffer)
+            .context("Failed to read requested bytes")?;
+
+        Ok(())
+    }
+
+    pub fn read_bytes(&mut self, offset: u64, length: usize) -> Result<Vec<u8>> {
         let mut buffer = vec![0u8; length];
 
-        self.file
-            .read_exact(&mut buffer)
-            .context("Failed to read requested bytes")?;
+        self.read_into(offset, &mut buffer)?;
 
         Ok(buffer)
     }
@@ -90,5 +94,52 @@ impl DiskImageReader {
             .context("Failed to read complete sector")?;
 
         Ok(buffer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn create_test_image() -> (PathBuf, File) {
+        let path = std::env::temp_dir().join(format!("recuvax-reader-test-{}", std::process::id()));
+
+        let mut file = File::create(&path).unwrap();
+        file.write_all(b"0123456789ABCDEF").unwrap();
+
+        (path, file)
+    }
+
+    #[test]
+    fn reads_into_reusable_buffer() {
+        let (path, _file) = create_test_image();
+
+        let mut reader = DiskImageReader::open(&path).unwrap();
+        let mut buffer = [0u8; 4];
+
+        reader.read_into(4, &mut buffer).unwrap();
+
+        assert_eq!(&buffer, b"4567");
+
+        reader.read_into(8, &mut buffer).unwrap();
+
+        assert_eq!(&buffer, b"89AB");
+
+        drop(reader);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_read_into_outside_image() {
+        let (path, _file) = create_test_image();
+
+        let mut reader = DiskImageReader::open(&path).unwrap();
+        let mut buffer = [0u8; 8];
+
+        assert!(reader.read_into(12, &mut buffer).is_err());
+
+        drop(reader);
+        let _ = std::fs::remove_file(path);
     }
 }
