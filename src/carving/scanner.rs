@@ -9,7 +9,9 @@ use super::signatures::FileFormat;
 use super::validator;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
-const MAX_FILE_SIZE: u64 = 64 * 1024 * 1024;
+const MAX_FILE_SIZE: usize = 64 * 1024 * 1024;
+const MAX_ACTIVE_CANDIDATES: usize = 16;
+const MAX_TOTAL_BUFFERED_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct CarvedFile {
@@ -18,55 +20,10 @@ pub struct CarvedFile {
     pub size: u64,
 }
 
-fn find_pattern(
-    reader: &mut DiskImageReader,
-    start: u64,
-    end: u64,
-    pattern: &[u8],
-) -> Result<Option<u64>> {
-    if pattern.is_empty() || start >= end {
-        return Ok(None);
-    }
-
-    let mut cursor = start;
-    let mut carry = Vec::new();
-
-    while cursor < end {
-        let remaining = end - cursor;
-        let length = usize::try_from(remaining.min(CHUNK_SIZE as u64))?;
-
-        let chunk = reader.read_bytes(cursor, length)?;
-
-        let mut data = carry.clone();
-        data.extend_from_slice(&chunk);
-
-        let base_offset = cursor - carry.len() as u64;
-
-        if data.len() >= pattern.len() {
-            for index in 0..=data.len() - pattern.len() {
-                let absolute_offset = base_offset + index as u64;
-
-                if absolute_offset >= start
-                    && absolute_offset + pattern.len() as u64 <= end
-                    && &data[index..index + pattern.len()] == pattern
-                {
-                    return Ok(Some(absolute_offset));
-                }
-            }
-        }
-
-        let keep = pattern.len().saturating_sub(1);
-
-        carry = if keep == 0 {
-            Vec::new()
-        } else {
-            data[data.len().saturating_sub(keep)..].to_vec()
-        };
-
-        cursor += length as u64;
-    }
-
-    Ok(None)
+struct Candidate {
+    format: FileFormat,
+    offset: u64,
+    data: Vec<u8>,
 }
 
 fn save_carved_file(
@@ -102,78 +59,37 @@ fn save_carved_file(
     }
 }
 
-fn scan_format(
-    reader: &mut DiskImageReader,
+fn validate_candidate(
+    candidate: Candidate,
     output_dir: &Path,
-    format: FileFormat,
-) -> Result<Vec<CarvedFile>> {
-    let mut recovered = Vec::new();
-    let mut cursor = 0u64;
-    let image_size = reader.size();
-    let mut sequence = 1u64;
+    sequence: &mut u64,
+) -> Result<Option<CarvedFile>> {
+    let validation = match candidate.format {
+        FileFormat::Jpeg => validator::validate_jpeg(&candidate.data),
+        FileFormat::Png => validator::validate_png(&candidate.data),
+        FileFormat::Pdf => validator::validate_pdf(&candidate.data),
+    };
 
-    while cursor < image_size {
-        let Some(header_offset) = find_pattern(reader, cursor, image_size, format.header())? else {
-            break;
-        };
+    if let Err(reason) = validation {
+        println!(
+            "Skipping invalid {} candidate at offset {}: {}",
+            candidate.format.name(),
+            candidate.offset,
+            reason
+        );
 
-        let footer_start = header_offset
-            .checked_add(format.header().len() as u64)
-            .context("Header offset overflow")?;
-
-        let maximum_end = header_offset
-            .checked_add(MAX_FILE_SIZE)
-            .unwrap_or(u64::MAX)
-            .min(image_size);
-
-        let footer_offset = find_pattern(reader, footer_start, maximum_end, format.footer())?;
-
-        let Some(footer_offset) = footer_offset else {
-            // Skip this candidate and continue searching.
-            cursor = header_offset + 1;
-            continue;
-        };
-
-        let file_end = footer_offset
-            .checked_add(format.footer().len() as u64)
-            .context("Footer offset overflow")?;
-
-        let file_size = file_end - header_offset;
-        let read_length =
-            usize::try_from(file_size).context("Recovered file is too large for this platform")?;
-
-        let data = reader.read_bytes(header_offset, read_length)?;
-
-        let validation = match format {
-            FileFormat::Png => validator::validate_png(&data),
-            FileFormat::Jpeg => validator::validate_jpeg(&data),
-            FileFormat::Pdf => validator::validate_pdf(&data),
-        };
-
-        if let Err(reason) = validation {
-            println!(
-                "Skipping invalid {} candidate at offset {}: {}",
-                format.name(),
-                header_offset,
-                reason
-            );
-
-            cursor = header_offset + 1;
-            continue;
-        }
-
-        let path = save_carved_file(output_dir, format, &mut sequence, &data)?;
-
-        recovered.push(CarvedFile {
-            format,
-            path,
-            size: file_size,
-        });
-
-        cursor = file_end;
+        return Ok(None);
     }
 
-    Ok(recovered)
+    let size = candidate.data.len() as u64;
+
+    let path = save_carved_file(output_dir, candidate.format, sequence, &candidate.data)?;
+
+    Ok(Some(CarvedFile {
+        format: candidate.format,
+        path,
+        size,
+    }))
 }
 
 pub fn scan_image(
@@ -188,17 +104,201 @@ pub fn scan_image(
 
     fs::create_dir_all(output_dir).context("Failed to create recovery output directory")?;
 
+    println!("Starting single-pass file carving...");
+    println!("Supported formats: JPEG, PNG, PDF");
+
+    let image_size = reader.size();
+
+    let max_header_len = FileFormat::all()
+        .iter()
+        .map(|format| format.header().len())
+        .max()
+        .unwrap_or(1);
+
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut window = Vec::with_capacity(max_header_len);
+
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut total_buffered_bytes = 0usize;
+
     let mut recovered = Vec::new();
+    let mut sequence = 1u64;
+
+    let mut offset = 0u64;
+    let mut dropped_candidates = 0u64;
+
+    while offset < image_size {
+        let remaining = image_size - offset;
+        let length = usize::try_from(remaining.min(CHUNK_SIZE as u64))?;
+
+        reader.read_into(offset, &mut buffer[..length])?;
+
+        for (index, byte) in buffer[..length].iter().enumerate() {
+            let absolute_offset = offset + index as u64;
+
+            // Remove candidates that have reached the maximum file size.
+            let mut candidate_index = 0;
+
+            while candidate_index < candidates.len() {
+                if candidates[candidate_index].data.len() >= MAX_FILE_SIZE {
+                    let removed = candidates.remove(candidate_index);
+                    total_buffered_bytes -= removed.data.len();
+                    dropped_candidates += 1;
+
+                    println!(
+                        "Skipping {} candidate at offset {}: maximum file size exceeded",
+                        removed.format.name(),
+                        removed.offset
+                    );
+                } else {
+                    candidate_index += 1;
+                }
+            }
+
+            // Enforce the aggregate memory limit.
+            while !candidates.is_empty()
+                && total_buffered_bytes.saturating_add(candidates.len()) > MAX_TOTAL_BUFFERED_BYTES
+            {
+                let removed = candidates.remove(0);
+                total_buffered_bytes -= removed.data.len();
+                dropped_candidates += 1;
+
+                println!(
+                    "Dropping oldest {} candidate at offset {}: memory limit reached",
+                    removed.format.name(),
+                    removed.offset
+                );
+            }
+
+            // Append the current byte to every active candidate.
+            for candidate in &mut candidates {
+                candidate.data.push(*byte);
+            }
+
+            total_buffered_bytes += candidates.len();
+
+            // Check whether any candidate has reached its footer.
+            let mut candidate_index = 0;
+
+            while candidate_index < candidates.len() {
+                let format = candidates[candidate_index].format;
+                let footer = format.footer();
+
+                let completed = candidates[candidate_index].data.ends_with(footer);
+
+                if completed {
+                    let candidate = candidates.remove(candidate_index);
+
+                    total_buffered_bytes -= candidate.data.len();
+
+                    if let Some(file) = validate_candidate(candidate, output_dir, &mut sequence)? {
+                        println!(
+                            "Recovered {}: {} ({} bytes)",
+                            file.format.name(),
+                            file.path.display(),
+                            file.size
+                        );
+
+                        recovered.push(file);
+                    }
+                } else {
+                    candidate_index += 1;
+                }
+            }
+
+            // Maintain a rolling window for header detection.
+            window.push(*byte);
+
+            if window.len() > max_header_len {
+                window.remove(0);
+            }
+
+            // Detect all supported headers without rescanning the image.
+            for format in FileFormat::all() {
+                let header = format.header();
+
+                if window.len() < header.len() {
+                    continue;
+                }
+
+                if &window[window.len() - header.len()..] != header {
+                    continue;
+                }
+
+                let candidate_offset = absolute_offset + 1 - header.len() as u64;
+
+                if candidates.len() >= MAX_ACTIVE_CANDIDATES {
+                    dropped_candidates += 1;
+
+                    println!(
+                        "Skipping {} candidate at offset {}: too many active candidates",
+                        format.name(),
+                        candidate_offset
+                    );
+
+                    continue;
+                }
+
+                if total_buffered_bytes.saturating_add(header.len()) > MAX_TOTAL_BUFFERED_BYTES {
+                    dropped_candidates += 1;
+
+                    println!(
+                        "Skipping {} candidate at offset {}: memory limit reached",
+                        format.name(),
+                        candidate_offset
+                    );
+
+                    continue;
+                }
+
+                candidates.push(Candidate {
+                    format: *format,
+                    offset: candidate_offset,
+                    data: header.to_vec(),
+                });
+
+                total_buffered_bytes += header.len();
+
+                println!(
+                    "Detected {} header at offset {}",
+                    format.name(),
+                    candidate_offset
+                );
+            }
+        }
+
+        offset += length as u64;
+    }
+
+    if !candidates.is_empty() {
+        for candidate in &candidates {
+            println!(
+                "Incomplete {} candidate at offset {}: no valid footer found",
+                candidate.format.name(),
+                candidate.offset
+            );
+        }
+    }
+
+    if dropped_candidates > 0 {
+        println!(
+            "Skipped or dropped {} candidate(s) due to configured limits.",
+            dropped_candidates
+        );
+    }
+
+    println!("\nFile carving completed.");
 
     for format in FileFormat::all() {
-        println!("Scanning for {} files...", format.name());
+        let count = recovered
+            .iter()
+            .filter(|file| file.format == *format)
+            .count();
 
-        let files = scan_format(reader, output_dir, *format)?;
-
-        println!("Found {} {} file(s).", files.len(), format.name());
-
-        recovered.extend(files);
+        println!("Recovered {} {} file(s).", count, format.name());
     }
+
+    println!("Total recovered files: {}", recovered.len());
 
     Ok(recovered)
 }
@@ -216,181 +316,161 @@ mod tests {
         std::env::temp_dir().join(format!("recuvax-{label}-{}-{id}", std::process::id()))
     }
 
-    #[test]
-    fn finds_pattern_across_chunk_boundary() {
-        let image_path = temporary_path("boundary");
-
-        let mut image = vec![0xAA; CHUNK_SIZE - 3];
-        image.extend_from_slice(b"HEADER");
-        image.extend_from_slice(&[0xBB; 20]);
+    fn run_scan(image: &[u8], label: &str) -> (Vec<CarvedFile>, PathBuf, PathBuf) {
+        let image_path = temporary_path(&format!("{label}-image"));
+        let output_dir = temporary_path(&format!("{label}-output"));
 
         fs::write(&image_path, image).unwrap();
 
         let mut reader = DiskImageReader::open(&image_path).unwrap();
 
-        let image_size = reader.size();
-
-        let result = find_pattern(&mut reader, 0, image_size, b"HEADER");
+        let recovered = scan_image(&mut reader, &output_dir).unwrap();
 
         drop(reader);
-        let _ = fs::remove_file(image_path);
 
-        assert_eq!(result.unwrap(), Some((CHUNK_SIZE - 3) as u64));
+        (recovered, image_path, output_dir)
+    }
+
+    fn cleanup(image_path: PathBuf, output_dir: PathBuf) {
+        let _ = fs::remove_file(image_path);
+        let _ = fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn finds_pattern_across_chunk_boundary() {
+        let mut image = vec![0xAA; CHUNK_SIZE - 2];
+
+        image.extend_from_slice(&validator::test_jpeg());
+
+        let (recovered, image_path, output_dir) = run_scan(&image, "boundary");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].format, FileFormat::Jpeg);
+
+        cleanup(image_path, output_dir);
     }
 
     #[test]
     fn carves_synthetic_png() {
-        let image_path = temporary_path("png-image");
-        let output_dir = temporary_path("png-output");
-
         let mut image = vec![0xAA; 100];
+
         image.extend_from_slice(&validator::test_png());
         image.extend_from_slice(&[0xBB; 100]);
 
-        fs::write(&image_path, image).unwrap();
-        fs::create_dir_all(&output_dir).unwrap();
+        let (recovered, image_path, output_dir) = run_scan(&image, "png");
 
-        let mut reader = DiskImageReader::open(&image_path).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].format, FileFormat::Png);
 
-        let result = scan_format(&mut reader, &output_dir, FileFormat::Png).unwrap();
+        let data = fs::read(&recovered[0].path).unwrap();
 
-        assert_eq!(result.len(), 1);
+        assert!(validator::validate_png(&data).is_ok());
 
-        let recovered = fs::read(&result[0].path).unwrap();
-        assert!(validator::validate_png(&recovered).is_ok());
-
-        drop(reader);
-        let _ = fs::remove_file(image_path);
-        let _ = fs::remove_dir_all(output_dir);
+        cleanup(image_path, output_dir);
     }
 
     #[test]
     fn carves_synthetic_jpeg() {
-        let image_path = temporary_path("jpeg-image");
-        let output_dir = temporary_path("jpeg-output");
-
         let mut image = vec![0xAA; 100];
+
         image.extend_from_slice(&validator::test_jpeg());
         image.extend_from_slice(&[0xBB; 100]);
 
-        fs::write(&image_path, image).unwrap();
-        fs::create_dir_all(&output_dir).unwrap();
+        let (recovered, image_path, output_dir) = run_scan(&image, "jpeg");
 
-        let mut reader = DiskImageReader::open(&image_path).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].format, FileFormat::Jpeg);
 
-        let result = scan_format(&mut reader, &output_dir, FileFormat::Jpeg).unwrap();
+        let data = fs::read(&recovered[0].path).unwrap();
 
-        assert_eq!(result.len(), 1);
+        assert!(validator::validate_jpeg(&data).is_ok());
 
-        let recovered = fs::read(&result[0].path).unwrap();
-        assert!(validator::validate_jpeg(&recovered).is_ok());
-
-        drop(reader);
-        let _ = fs::remove_file(image_path);
-        let _ = fs::remove_dir_all(output_dir);
-    }
-
-    #[test]
-    fn skips_invalid_jpeg() {
-        let image_path = temporary_path("invalid-jpeg-image");
-        let output_dir = temporary_path("invalid-jpeg-output");
-
-        let mut image = vec![0xAA; 100];
-        image.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0x11, 0x22, 0x33, 0xFF, 0xD9]);
-
-        fs::write(&image_path, image).unwrap();
-        fs::create_dir_all(&output_dir).unwrap();
-
-        let mut reader = DiskImageReader::open(&image_path).unwrap();
-
-        let result = scan_format(&mut reader, &output_dir, FileFormat::Jpeg).unwrap();
-
-        assert!(result.is_empty());
-        assert!(fs::read_dir(&output_dir).unwrap().next().is_none());
-
-        drop(reader);
-        let _ = fs::remove_file(image_path);
-        let _ = fs::remove_dir_all(output_dir);
+        cleanup(image_path, output_dir);
     }
 
     #[test]
     fn carves_synthetic_pdf() {
-        let image_path = temporary_path("pdf-image");
-        let output_dir = temporary_path("pdf-output");
-
         let mut image = vec![0xAA; 100];
+
         image.extend_from_slice(&validator::test_pdf());
         image.extend_from_slice(&[0xBB; 100]);
 
-        fs::write(&image_path, image).unwrap();
-        fs::create_dir_all(&output_dir).unwrap();
+        let (recovered, image_path, output_dir) = run_scan(&image, "pdf");
 
-        let mut reader = DiskImageReader::open(&image_path).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].format, FileFormat::Pdf);
 
-        let result = scan_format(&mut reader, &output_dir, FileFormat::Pdf).unwrap();
+        let data = fs::read(&recovered[0].path).unwrap();
 
-        assert_eq!(result.len(), 1);
+        assert!(validator::validate_pdf(&data).is_ok());
 
-        let recovered = fs::read(&result[0].path).unwrap();
+        cleanup(image_path, output_dir);
+    }
 
-        assert!(recovered.starts_with(FileFormat::Pdf.header()));
-        assert!(recovered.ends_with(FileFormat::Pdf.footer()));
+    #[test]
+    fn scans_multiple_formats_in_one_image() {
+        let mut image = vec![0xAA; 100];
 
-        drop(reader);
-        let _ = fs::remove_file(image_path);
-        let _ = fs::remove_dir_all(output_dir);
+        image.extend_from_slice(&validator::test_jpeg());
+        image.extend_from_slice(&[0xBB; 100]);
+
+        image.extend_from_slice(&validator::test_png());
+        image.extend_from_slice(&[0xCC; 100]);
+
+        image.extend_from_slice(&validator::test_pdf());
+
+        let (recovered, image_path, output_dir) = run_scan(&image, "multiple");
+
+        assert_eq!(recovered.len(), 3);
+
+        assert!(recovered.iter().any(|file| file.format == FileFormat::Jpeg));
+        assert!(recovered.iter().any(|file| file.format == FileFormat::Png));
+        assert!(recovered.iter().any(|file| file.format == FileFormat::Pdf));
+
+        cleanup(image_path, output_dir);
+    }
+
+    #[test]
+    fn skips_invalid_jpeg() {
+        let mut image = vec![0xAA; 100];
+
+        image.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0x11, 0x22, 0x33, 0xFF, 0xD9]);
+
+        let (recovered, image_path, output_dir) = run_scan(&image, "invalid-jpeg");
+
+        assert!(recovered.is_empty());
+        assert!(!output_dir.exists() || fs::read_dir(&output_dir).unwrap().next().is_none());
+
+        cleanup(image_path, output_dir);
     }
 
     #[test]
     fn skips_invalid_png() {
-        let image_path = temporary_path("invalid-png-image");
-        let output_dir = temporary_path("invalid-png-output");
-
         let mut image = vec![0xAA; 100];
+
         image.extend_from_slice(FileFormat::Png.header());
         image.extend_from_slice(b"INVALID PNG DATA");
         image.extend_from_slice(FileFormat::Png.footer());
 
-        fs::write(&image_path, image).unwrap();
-        fs::create_dir_all(&output_dir).unwrap();
+        let (recovered, image_path, output_dir) = run_scan(&image, "invalid-png");
 
-        let mut reader = DiskImageReader::open(&image_path).unwrap();
+        assert!(recovered.is_empty());
+        assert!(!output_dir.exists() || fs::read_dir(&output_dir).unwrap().next().is_none());
 
-        let result = scan_format(&mut reader, &output_dir, FileFormat::Png).unwrap();
-
-        assert!(result.is_empty());
-
-        let output_files: Vec<_> = fs::read_dir(&output_dir).unwrap().collect();
-        assert!(output_files.is_empty());
-
-        drop(reader);
-        let _ = fs::remove_file(image_path);
-        let _ = fs::remove_dir_all(output_dir);
+        cleanup(image_path, output_dir);
     }
 
     #[test]
     fn skips_invalid_pdf() {
-        let image_path = temporary_path("invalid-pdf-image");
-        let output_dir = temporary_path("invalid-pdf-output");
-
         let mut image = vec![0xAA; 100];
+
         image.extend_from_slice(b"%PDF-1.7\nINVALID PDF DATA\n%%EOF");
-        image.extend_from_slice(&[0xBB; 100]);
 
-        fs::write(&image_path, image).unwrap();
-        fs::create_dir_all(&output_dir).unwrap();
+        let (recovered, image_path, output_dir) = run_scan(&image, "invalid-pdf");
 
-        let mut reader = DiskImageReader::open(&image_path).unwrap();
+        assert!(recovered.is_empty());
+        assert!(!output_dir.exists() || fs::read_dir(&output_dir).unwrap().next().is_none());
 
-        let result = scan_format(&mut reader, &output_dir, FileFormat::Pdf).unwrap();
-
-        assert!(result.is_empty());
-
-        let output_files: Vec<_> = fs::read_dir(&output_dir).unwrap().collect();
-        assert!(output_files.is_empty());
-
-        drop(reader);
-        let _ = fs::remove_file(image_path);
-        let _ = fs::remove_dir_all(output_dir);
+        cleanup(image_path, output_dir);
     }
 }
