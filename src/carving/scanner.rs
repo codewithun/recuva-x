@@ -26,6 +26,27 @@ struct Candidate {
     data: Vec<u8>,
 }
 
+// Check whether a candidate has reached the maximum allowed size.
+fn candidate_is_too_large(candidate_size: usize) -> bool {
+    candidate_size >= MAX_FILE_SIZE
+}
+
+// Check whether a new candidate can be accepted.
+fn candidate_limit_reason(
+    active_candidates: usize,
+    buffered_bytes: usize,
+    header_len: usize,
+) -> Option<&'static str> {
+    if active_candidates >= MAX_ACTIVE_CANDIDATES {
+        Some("too many active candidates")
+    } else if buffered_bytes.saturating_add(header_len) > MAX_TOTAL_BUFFERED_BYTES {
+        Some("memory limit reached")
+    } else {
+        None
+    }
+}
+
+// Save recovered data without overwriting existing files.
 fn save_carved_file(
     output_dir: &Path,
     format: FileFormat,
@@ -52,6 +73,7 @@ fn save_carved_file(
         if let Err(error) = file.write_all(data) {
             drop(file);
             let _ = fs::remove_file(&path);
+
             return Err(error).context("Failed to write recovered file");
         }
 
@@ -59,6 +81,7 @@ fn save_carved_file(
     }
 }
 
+// Validate a completed candidate before saving it.
 fn validate_candidate(
     candidate: Candidate,
     output_dir: &Path,
@@ -92,6 +115,7 @@ fn validate_candidate(
     }))
 }
 
+// Scan a disk image in a single sequential pass.
 pub fn scan_image(
     reader: &mut DiskImageReader,
     output_dir: impl AsRef<Path>,
@@ -115,7 +139,10 @@ pub fn scan_image(
         .max()
         .unwrap_or(1);
 
+    // Reusable image read buffer.
     let mut buffer = vec![0u8; CHUNK_SIZE];
+
+    // Rolling window used to detect file headers.
     let mut window = Vec::with_capacity(max_header_len);
 
     let mut candidates: Vec<Candidate> = Vec::new();
@@ -140,8 +167,9 @@ pub fn scan_image(
             let mut candidate_index = 0;
 
             while candidate_index < candidates.len() {
-                if candidates[candidate_index].data.len() >= MAX_FILE_SIZE {
+                if candidate_is_too_large(candidates[candidate_index].data.len()) {
                     let removed = candidates.remove(candidate_index);
+
                     total_buffered_bytes -= removed.data.len();
                     dropped_candidates += 1;
 
@@ -155,11 +183,12 @@ pub fn scan_image(
                 }
             }
 
-            // Enforce the aggregate memory limit.
+            // Enforce the aggregate buffered-data limit.
             while !candidates.is_empty()
                 && total_buffered_bytes.saturating_add(candidates.len()) > MAX_TOTAL_BUFFERED_BYTES
             {
                 let removed = candidates.remove(0);
+
                 total_buffered_bytes -= removed.data.len();
                 dropped_candidates += 1;
 
@@ -206,7 +235,7 @@ pub fn scan_image(
                 }
             }
 
-            // Maintain a rolling window for header detection.
+            // Maintain the rolling window for header detection.
             window.push(*byte);
 
             if window.len() > max_header_len {
@@ -227,25 +256,17 @@ pub fn scan_image(
 
                 let candidate_offset = absolute_offset + 1 - header.len() as u64;
 
-                if candidates.len() >= MAX_ACTIVE_CANDIDATES {
+                // Enforce candidate and buffered-data limits.
+                if let Some(reason) =
+                    candidate_limit_reason(candidates.len(), total_buffered_bytes, header.len())
+                {
                     dropped_candidates += 1;
 
                     println!(
-                        "Skipping {} candidate at offset {}: too many active candidates",
+                        "Skipping {} candidate at offset {}: {}",
                         format.name(),
-                        candidate_offset
-                    );
-
-                    continue;
-                }
-
-                if total_buffered_bytes.saturating_add(header.len()) > MAX_TOTAL_BUFFERED_BYTES {
-                    dropped_candidates += 1;
-
-                    println!(
-                        "Skipping {} candidate at offset {}: memory limit reached",
-                        format.name(),
-                        candidate_offset
+                        candidate_offset,
+                        reason
                     );
 
                     continue;
@@ -270,6 +291,7 @@ pub fn scan_image(
         offset += length as u64;
     }
 
+    // Report candidates that never reached a footer.
     if !candidates.is_empty() {
         for candidate in &candidates {
             println!(
@@ -439,6 +461,7 @@ mod tests {
         let (recovered, image_path, output_dir) = run_scan(&image, "invalid-jpeg");
 
         assert!(recovered.is_empty());
+
         assert!(!output_dir.exists() || fs::read_dir(&output_dir).unwrap().next().is_none());
 
         cleanup(image_path, output_dir);
@@ -455,6 +478,7 @@ mod tests {
         let (recovered, image_path, output_dir) = run_scan(&image, "invalid-png");
 
         assert!(recovered.is_empty());
+
         assert!(!output_dir.exists() || fs::read_dir(&output_dir).unwrap().next().is_none());
 
         cleanup(image_path, output_dir);
@@ -469,8 +493,110 @@ mod tests {
         let (recovered, image_path, output_dir) = run_scan(&image, "invalid-pdf");
 
         assert!(recovered.is_empty());
+
         assert!(!output_dir.exists() || fs::read_dir(&output_dir).unwrap().next().is_none());
 
         cleanup(image_path, output_dir);
+    }
+
+    #[test]
+    fn does_not_overwrite_existing_recovered_file() {
+        let image_path = temporary_path("no-overwrite-image");
+        let output_dir = temporary_path("no-overwrite-output");
+
+        fs::write(&image_path, validator::test_jpeg()).unwrap();
+        fs::create_dir_all(&output_dir).unwrap();
+
+        let existing_path = output_dir.join("recovered_000001.jpg");
+        let original_content = b"DO NOT OVERWRITE THIS FILE";
+
+        fs::write(&existing_path, original_content).unwrap();
+
+        let mut reader = DiskImageReader::open(&image_path).unwrap();
+
+        let recovered = scan_image(&mut reader, &output_dir).unwrap();
+
+        assert_eq!(recovered.len(), 1);
+
+        assert_eq!(fs::read(&existing_path).unwrap(), original_content);
+
+        assert_eq!(
+            recovered[0].path.file_name().unwrap(),
+            "recovered_000002.jpg"
+        );
+
+        drop(reader);
+        cleanup(image_path, output_dir);
+    }
+
+    #[test]
+    fn finds_valid_file_after_false_header() {
+        let mut image = vec![0xAA; 100];
+
+        // False JPEG candidate.
+        image.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0x11, 0x22, 0x33]);
+
+        // A valid JPEG appears before the false candidate's footer.
+        image.extend_from_slice(&validator::test_jpeg());
+
+        let (recovered, image_path, output_dir) = run_scan(&image, "false-header");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].format, FileFormat::Jpeg);
+
+        let recovered_data = fs::read(&recovered[0].path).unwrap();
+
+        assert_eq!(recovered_data, validator::test_jpeg());
+
+        cleanup(image_path, output_dir);
+    }
+
+    #[test]
+    fn ignores_candidate_without_footer() {
+        let mut image = vec![0xAA; 100];
+
+        image.extend_from_slice(FileFormat::Jpeg.header());
+        image.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55]);
+
+        let (recovered, image_path, output_dir) = run_scan(&image, "missing-footer");
+
+        assert!(recovered.is_empty());
+
+        assert!(!output_dir.exists() || fs::read_dir(&output_dir).unwrap().next().is_none());
+
+        cleanup(image_path, output_dir);
+    }
+
+    #[test]
+    fn enforces_maximum_candidate_size() {
+        assert!(!candidate_is_too_large(MAX_FILE_SIZE - 1));
+        assert!(candidate_is_too_large(MAX_FILE_SIZE));
+        assert!(candidate_is_too_large(MAX_FILE_SIZE + 1));
+    }
+
+    #[test]
+    fn enforces_active_candidate_limit() {
+        assert_eq!(
+            candidate_limit_reason(MAX_ACTIVE_CANDIDATES - 1, 0, 8,),
+            None
+        );
+
+        assert_eq!(
+            candidate_limit_reason(MAX_ACTIVE_CANDIDATES, 0, 8,),
+            Some("too many active candidates")
+        );
+    }
+
+    #[test]
+    fn enforces_total_buffered_data_limit() {
+        assert_eq!(
+            candidate_limit_reason(0, MAX_TOTAL_BUFFERED_BYTES - 8, 8,),
+            None
+        );
+
+        assert_eq!(
+            candidate_limit_reason(0, MAX_TOTAL_BUFFERED_BYTES - 7, 8,),
+            Some("memory limit reached")
+        );
     }
 }

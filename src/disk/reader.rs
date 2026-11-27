@@ -101,9 +101,15 @@ impl DiskImageReader {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn create_test_image() -> (PathBuf, File) {
-        let path = std::env::temp_dir().join(format!("recuvax-reader-test-{}", std::process::id()));
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        let path =
+            std::env::temp_dir().join(format!("recuvax-reader-test-{}-{id}", std::process::id()));
 
         let mut file = File::create(&path).unwrap();
         file.write_all(b"0123456789ABCDEF").unwrap();
@@ -127,6 +133,8 @@ mod tests {
         assert_eq!(&buffer, b"89AB");
 
         drop(reader);
+        drop(_file);
+
         let _ = std::fs::remove_file(path);
     }
 
@@ -140,6 +148,8 @@ mod tests {
         assert!(reader.read_into(12, &mut buffer).is_err());
 
         drop(reader);
+        drop(_file);
+
         let _ = std::fs::remove_file(path);
     }
 }
