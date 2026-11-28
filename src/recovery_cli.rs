@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use dialoguer::{Input, Select, theme::ColorfulTheme};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::disk::reader::DiskImageReader;
 use crate::filesystem::{
@@ -9,6 +9,7 @@ use crate::filesystem::{
     recovery,
 };
 use crate::partition::{gpt, mbr};
+use crate::recovery::{RecoveryRecord, write_report};
 
 struct PartitionCandidate {
     index: usize,
@@ -74,13 +75,34 @@ fn output_directory() -> Result<PathBuf> {
     Ok(path)
 }
 
-fn recover_single_file(reader: &mut Fat32ClusterReader<'_>, entry: &DirectoryEntry) -> Result<()> {
+/// Write a report without treating report failure as recovery failure.
+fn export_recovery_report(output_dir: &Path, records: &[RecoveryRecord]) {
+    match write_report(output_dir, records) {
+        Ok(path) => {
+            println!("Recovery report: {}", path.display());
+        }
+        Err(error) => {
+            eprintln!(
+                "Warning: Files were recovered, but the JSON report could not be saved: {error:#}"
+            );
+        }
+    }
+}
+
+fn recover_single_file(
+    reader: &mut Fat32ClusterReader<'_>,
+    entry: &DirectoryEntry,
+    source_image: &Path,
+) -> Result<()> {
     let output = output_directory()?;
 
-    let recovered = recovery::recover_file(reader, entry, &output)?;
+    let record = recovery::recover_file_with_metadata(reader, entry, &output, source_image)?;
 
     println!("\nRecovered successfully!");
-    println!("Output: {}", recovered.display());
+    println!("Output: {}", record.output_path);
+    println!("Source cluster: {:?}", record.source_cluster);
+
+    export_recovery_report(&output, &[record]);
 
     Ok(())
 }
@@ -88,29 +110,48 @@ fn recover_single_file(reader: &mut Fat32ClusterReader<'_>, entry: &DirectoryEnt
 fn recover_selected_directory(
     reader: &mut Fat32ClusterReader<'_>,
     entry: &DirectoryEntry,
+    source_image: &Path,
 ) -> Result<()> {
     let output = output_directory()?.join(&entry.name);
 
-    let recovered = recovery::recover_directory(reader, entry.first_cluster, &output)?;
+    let records = recovery::recover_directory_with_metadata(
+        reader,
+        entry.first_cluster,
+        &output,
+        source_image,
+    )?;
 
-    println!("\nRecovered {} files.", recovered.len());
+    println!("\nRecovered {} files.", records.len());
     println!("Output: {}", output.display());
+
+    export_recovery_report(&output, &records);
 
     Ok(())
 }
 
-fn recover_current_directory(reader: &mut Fat32ClusterReader<'_>, cluster: u32) -> Result<()> {
+fn recover_current_directory(
+    reader: &mut Fat32ClusterReader<'_>,
+    cluster: u32,
+    source_image: &Path,
+) -> Result<()> {
     let output = output_directory()?;
 
-    let recovered = recovery::recover_directory(reader, cluster, &output)?;
+    let records =
+        recovery::recover_directory_with_metadata(reader, cluster, &output, source_image)?;
 
-    println!("\nRecovered {} files.", recovered.len());
+    println!("\nRecovered {} files.", records.len());
     println!("Output: {}", output.display());
+
+    export_recovery_report(&output, &records);
 
     Ok(())
 }
 
-fn browse_directory(reader: &mut Fat32ClusterReader<'_>, root_cluster: u32) -> Result<()> {
+fn browse_directory(
+    reader: &mut Fat32ClusterReader<'_>,
+    root_cluster: u32,
+    source_image: &Path,
+) -> Result<()> {
     let mut stack = vec![(root_cluster, String::from("/"))];
 
     loop {
@@ -149,7 +190,7 @@ fn browse_directory(reader: &mut Fat32ClusterReader<'_>, root_cluster: u32) -> R
             .interact()?;
 
         if selection == 0 {
-            match recover_current_directory(reader, *current_cluster) {
+            match recover_current_directory(reader, *current_cluster, source_image) {
                 Ok(()) => {}
                 Err(error) => eprintln!("\nRecovery failed: {error:#}"),
             }
@@ -173,7 +214,7 @@ fn browse_directory(reader: &mut Fat32ClusterReader<'_>, root_cluster: u32) -> R
                     0 => {
                         stack.push((entry.first_cluster, entry.name.clone()));
                     }
-                    1 => match recover_selected_directory(reader, &entry) {
+                    1 => match recover_selected_directory(reader, &entry, source_image) {
                         Ok(()) => {}
                         Err(error) => {
                             eprintln!("\nRecovery failed: {error:#}");
@@ -182,7 +223,7 @@ fn browse_directory(reader: &mut Fat32ClusterReader<'_>, root_cluster: u32) -> R
                     _ => {}
                 }
             } else {
-                match recover_single_file(reader, &entry) {
+                match recover_single_file(reader, &entry, source_image) {
                     Ok(()) => {}
                     Err(error) => {
                         eprintln!("\nRecovery failed: {error:#}");
@@ -213,7 +254,9 @@ pub fn run() -> Result<()> {
         .with_prompt("Enter disk image path")
         .interact_text()?;
 
-    let mut reader = DiskImageReader::open(&image_path)?;
+    let source_image = PathBuf::from(image_path.trim());
+
+    let mut reader = DiskImageReader::open(&source_image)?;
 
     println!("\nScanning partitions...");
 
@@ -252,7 +295,7 @@ pub fn run() -> Result<()> {
     println!("\nFAT32 partition selected.");
     println!("Root cluster: {root_cluster}");
 
-    browse_directory(&mut fat_reader, root_cluster)?;
+    browse_directory(&mut fat_reader, root_cluster, &source_image)?;
 
     Ok(())
 }

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::filesystem::directory::entries::DirectoryEntry;
 use crate::filesystem::directory::fat32::Fat32ClusterReader;
+use crate::recovery::{RecoveryMethod, RecoveryRecord};
 
 /// Recover one FAT32 file into a separate output directory.
 pub fn recover_file(
@@ -87,12 +88,58 @@ pub fn recover_file(
     Ok(output_path)
 }
 
+/// Recover one file and return its recovery metadata.
+pub fn recover_file_with_metadata(
+    reader: &mut Fat32ClusterReader<'_>,
+    entry: &DirectoryEntry,
+    output_dir: impl AsRef<Path>,
+    source_image: impl AsRef<Path>,
+) -> Result<RecoveryRecord> {
+    let output_path = recover_file(reader, entry, output_dir)?;
+
+    let format = Path::new(&entry.name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_uppercase())
+        .filter(|extension| !extension.is_empty())
+        .unwrap_or_else(|| "UNKNOWN".to_string());
+
+    Ok(RecoveryRecord::new(
+        output_path,
+        source_image,
+        format,
+        u64::from(entry.size),
+        None,
+        if entry.size > 0 {
+            Some(entry.first_cluster)
+        } else {
+            None
+        },
+        RecoveryMethod::QuickRecovery,
+    ))
+}
+
 /// Recover a directory and all its nested files and directories.
 pub fn recover_directory(
     reader: &mut Fat32ClusterReader<'_>,
     start_cluster: u32,
     output_dir: impl AsRef<Path>,
 ) -> Result<Vec<PathBuf>> {
+    let records = recover_directory_with_metadata(reader, start_cluster, output_dir, "")?;
+
+    Ok(records
+        .into_iter()
+        .map(|record| PathBuf::from(record.output_path))
+        .collect())
+}
+
+/// Recover a directory and return metadata for every recovered file.
+pub fn recover_directory_with_metadata(
+    reader: &mut Fat32ClusterReader<'_>,
+    start_cluster: u32,
+    output_dir: impl AsRef<Path>,
+    source_image: impl AsRef<Path>,
+) -> Result<Vec<RecoveryRecord>> {
     let output_dir = output_dir.as_ref();
 
     fs::create_dir_all(output_dir).context("Failed to create recovery directory")?;
@@ -106,6 +153,7 @@ pub fn recover_directory(
         output_dir,
         &mut visited,
         &mut recovered_files,
+        source_image.as_ref(),
     )?;
 
     Ok(recovered_files)
@@ -116,7 +164,8 @@ fn recover_directory_recursive(
     start_cluster: u32,
     output_dir: &Path,
     visited: &mut HashSet<u32>,
-    recovered_files: &mut Vec<PathBuf>,
+    recovered_files: &mut Vec<RecoveryRecord>,
+    source_image: &Path,
 ) -> Result<()> {
     if !visited.insert(start_cluster) {
         bail!("Circular directory reference detected at cluster {start_cluster}");
@@ -155,11 +204,31 @@ fn recover_directory_recursive(
                 &output_path,
                 visited,
                 recovered_files,
+                source_image,
             )?;
         } else {
             let recovered = recover_file(reader, &entry, output_dir)?;
 
-            recovered_files.push(recovered);
+            let format = Path::new(&entry.name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.to_ascii_uppercase())
+                .filter(|extension| !extension.is_empty())
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+
+            recovered_files.push(RecoveryRecord::new(
+                recovered,
+                source_image,
+                format,
+                u64::from(entry.size),
+                None,
+                if entry.size > 0 {
+                    Some(entry.first_cluster)
+                } else {
+                    None
+                },
+                RecoveryMethod::QuickRecovery,
+            ));
         }
     }
 

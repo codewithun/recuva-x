@@ -18,6 +18,7 @@ pub struct CarvedFile {
     pub format: FileFormat,
     pub path: PathBuf,
     pub size: u64,
+    pub source_offset: u64,
 }
 
 struct Candidate {
@@ -112,6 +113,7 @@ fn validate_candidate(
         format: candidate.format,
         path,
         size,
+        source_offset: candidate.offset,
     }))
 }
 

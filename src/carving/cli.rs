@@ -3,6 +3,7 @@ use dialoguer::{Input, theme::ColorfulTheme};
 use std::path::PathBuf;
 
 use crate::disk::reader::DiskImageReader;
+use crate::recovery::{RecoveryMethod, RecoveryRecord, write_report};
 
 use super::scanner;
 
@@ -29,7 +30,7 @@ fn output_directory() -> Result<PathBuf> {
     let path = PathBuf::from(path.trim());
 
     if path.as_os_str().is_empty() {
-        bail!("Output directory cannot be empty.");
+        bail!("Recovery output directory cannot be empty.");
     }
 
     Ok(path)
@@ -55,10 +56,15 @@ pub fn run() -> Result<()> {
 
     println!("\n========== RECOVERY SUMMARY ==========");
 
+    let mut records = Vec::with_capacity(recovered.len());
+
     if recovered.is_empty() {
         println!("No recoverable files found.");
     } else {
-        let total_size: u64 = recovered.iter().map(|file| file.size).sum();
+        let total_size = recovered
+            .iter()
+            .map(|file| file.size)
+            .fold(0u64, u64::saturating_add);
 
         for (index, file) in recovered.iter().enumerate() {
             println!(
@@ -68,10 +74,32 @@ pub fn run() -> Result<()> {
                 file.path.display(),
                 file.size
             );
+
+            records.push(RecoveryRecord::new(
+                &file.path,
+                &image_path,
+                file.format.name(),
+                file.size,
+                Some(file.source_offset),
+                None,
+                RecoveryMethod::DeepRecovery,
+            ));
         }
 
         println!("\nTotal recovered files: {}", recovered.len());
         println!("Total recovered size: {} bytes", total_size);
+    }
+
+    // Report failure must not invalidate successfully recovered files.
+    match write_report(&output_dir, &records) {
+        Ok(path) => {
+            println!("\nRecovery report: {}", path.display());
+        }
+        Err(error) => {
+            eprintln!(
+                "\nWarning: Recovery completed, but the JSON report could not be saved: {error:#}"
+            );
+        }
     }
 
     println!("\nRecovery output: {}", output_dir.display());

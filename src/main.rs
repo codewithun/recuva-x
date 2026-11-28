@@ -3,6 +3,7 @@ mod devices;
 mod disk;
 mod filesystem;
 mod partition;
+mod recovery;
 mod recovery_cli;
 
 use anyhow::Result;
